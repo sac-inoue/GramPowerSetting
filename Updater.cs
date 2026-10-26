@@ -113,6 +113,7 @@ public sealed class Updater : IDisposable
         foreach (var src in files)
             TryDelete(src);
 
+        Log.Write($"自動更新: {files.Length} ファイルを入れ替えて再起動");
         Process.Start(new ProcessStartInfo(Path.Combine(_installDir, "GramCooling.exe"), RestartedArg) { UseShellExecute = false });
         _exit();
     }

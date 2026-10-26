@@ -11,7 +11,7 @@ namespace GramCooling;
 /// 自分が負荷にならないよう、センサーは 5 秒ごと、めったに変わらない設定は 30 秒ごと（とメニューを開いたとき）に読み、
 /// 画面ロック中・スリープ中は止める。
 /// </summary>
-public sealed class TrayApp : ApplicationContext
+public sealed partial class TrayApp : ApplicationContext
 {
     private static readonly LgCooling.Mode[] CoolingModes =
         { LgCooling.Mode.Silent, LgCooling.Mode.Low, LgCooling.Mode.Normal, LgCooling.Mode.High };
@@ -24,8 +24,10 @@ public sealed class TrayApp : ApplicationContext
     private const int MaxSensorMisses = 3;     // これだけ続けて読めなかったら "--" にする
 
     private readonly Settings _settings = Settings.Load();
+    private readonly SynchronizationContext _ui;
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _statusItem;
+    private readonly ToolStripMenuItem _boostItem;
     private readonly Dictionary<LgCooling.Mode, ToolStripMenuItem> _coolingItems = new();
     private readonly Dictionary<LgBattery.Mode, ToolStripMenuItem> _batteryItems = new();
     private readonly ToolStripMenuItem _keepItem;
@@ -50,20 +52,24 @@ public sealed class TrayApp : ApplicationContext
     private int _rpmMisses, _tempMisses;
     private string? _sensorError, _settingsError;
 
-    public TrayApp()
+    /// <param name="startup">通常の起動ならブーストを始める。自動更新での再起動なら false（前のブーストを引き継ぐ）。</param>
+    public TrayApp(bool startup)
     {
         var menu = new ContextMenuStrip();
+        _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         menu.Opening += (_, _) => _ = RefreshAsync(settings: true);
 
         _statusItem = new ToolStripMenuItem("読み取り中…") { Enabled = false };
         menu.Items.Add(_statusItem);
+        _boostItem = new ToolStripMenuItem { Enabled = false, Visible = false };
+        menu.Items.Add(_boostItem);
 
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("冷却モード") { Enabled = false });
         foreach (var m in CoolingModes)
         {
             var item = new ToolStripMenuItem("　" + LgCooling.DisplayName(m));
-            item.Click += async (_, _) => await ApplyAsync(() => LgCooling.Set(m, _settings.KeepAfterReboot));
+            item.Click += async (_, _) => await OnUserCoolingAsync(m);
             _coolingItems[m] = item;
             menu.Items.Add(item);
         }
@@ -87,11 +93,7 @@ public sealed class TrayApp : ApplicationContext
 
         menu.Items.Add(new ToolStripSeparator());
         _saverItem = new ToolStripMenuItem("省エネ機能（Windows）");
-        _saverItem.Click += async (_, _) =>
-        {
-            bool on = !_saverItem.Checked;
-            await ApplyAsync(() => EnergySaver.Set(on));
-        };
+        _saverItem.Click += async (_, _) => await OnUserSaverAsync(!_saverItem.Checked);
         menu.Items.Add(_saverItem);
 
         menu.Items.Add(new ToolStripSeparator());
@@ -114,7 +116,11 @@ public sealed class TrayApp : ApplicationContext
         _autoStartItem = new ToolStripMenuItem("Windows 起動時に自動起動");
         _autoStartItem.Click += (_, _) => ToggleAutoStart();
         menu.Items.Add(_autoStartItem);
-        menu.Items.Add("終了", null, (_, _) => ExitThread());
+        menu.Items.Add("終了", null, (_, _) =>
+        {
+            Log.Write("メニューの「終了」");
+            ExitThread();
+        });
         menu.Items.Add(new ToolStripMenuItem($"ビルド {Updater.BuildTime:yyyy-MM-dd HH:mm}") { Enabled = false });
 
         _tray = new NotifyIcon { ContextMenuStrip = menu, Text = "gram 冷却", Visible = true };
@@ -131,18 +137,25 @@ public sealed class TrayApp : ApplicationContext
 
         _updater = new Updater(ExitThread, ShowError);
 
+        SystemEvents.SessionEnding += OnSessionEnding;
         SystemEvents.SessionSwitch += OnSessionSwitch;
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
 
+        // 省エネ機能の ON/OFF は実効電源モードの変化として通知される
+        EnergySaverState.Changed += OnEnergySaverChanged;
+        EnergySaverState.Start();
+
         _timer.Tick += async (_, _) =>
         {
-            if (++_tick % SettingsEveryTicks == 0)
+            // ブースト中はユーザーの変更にすぐ気づけるよう、設定も毎回読む
+            if (++_tick % SettingsEveryTicks == 0 || Boosting)
                 _settingsDue = true;
+            await CheckBoostExpiryAsync();
             await RefreshAsync(settings: false);
         };
         _timer.Start();
-        _ = RefreshAsync(settings: true);
+        _ = StartupAsync(startup);
     }
 
     /// <summary>初回起動時は自動起動を ON にする（既定 ON）。</summary>
@@ -182,6 +195,9 @@ public sealed class TrayApp : ApplicationContext
     }
 
     // 画面ロック中・スリープ中は読み取りを止める
+    private void OnSessionEnding(object? sender, SessionEndingEventArgs e) =>
+        Log.Write($"Windows のセッション終了 ({e.Reason})");
+
     private void OnSessionSwitch(object? sender, SessionSwitchEventArgs e)
     {
         if (e.Reason == SessionSwitchReason.SessionLock)
@@ -190,33 +206,43 @@ public sealed class TrayApp : ApplicationContext
             Resume();
     }
 
-    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e) => _ui.Post(_ =>
     {
         if (e.Mode == PowerModes.Suspend)
             _timer.Stop();
         else if (e.Mode == PowerModes.Resume)
             Resume();
-    }
+        else if (e.Mode == PowerModes.StatusChange)
+            OnPowerStatusChanged();  // AC アダプタの抜き差し
+    }, null);
 
     // 拡大率を変えたらアイコンの大きさが変わるので描き直す（大きさはキーに入っているので Show で判定される）
     private void OnDisplaySettingsChanged(object? sender, EventArgs e) => Show();
 
-    private void Resume()
+    // 通知は別スレッドから来るので UI スレッドで読み直す
+    private void OnEnergySaverChanged() => _ui.Post(_ => _ = RefreshAsync(settings: true), null);
+
+    private async void Resume()
     {
         _timer.Start();
-        _ = RefreshAsync(settings: true);
+        _powerLine = SystemInformation.PowerStatus.PowerLineStatus;  // スリープ中の抜き差しはブーストしない
+        await CheckBoostExpiryAsync();
+        await RefreshAsync(settings: true);
     }
 
     private async Task ApplyAsync(Action action)
     {
-        try
+        await WriteAsync(async () =>
         {
-            await Task.Run(action);
-        }
-        catch (Exception ex)
-        {
-            ShowError(ex.Message);
-        }
+            try
+            {
+                await Task.Run(action);
+            }
+            catch (Exception ex)
+            {
+                ShowError(ex.Message);
+            }
+        });
         await RefreshAsync(settings: true);
     }
 
@@ -230,7 +256,10 @@ public sealed class TrayApp : ApplicationContext
         {
             bool readSettings = _settingsDue;
             _settingsDue = false;
+            var started = DateTime.UtcNow;
             await Task.Run(() => Read(readSettings));
+            if (readSettings)
+                TrackUserSettings(started);
             Show();
         }
         finally
@@ -266,7 +295,7 @@ public sealed class TrayApp : ApplicationContext
         string? error = null;
         try { _cooling = LgCooling.Get(); } catch (Exception ex) { error = ex.Message; }
         try { _battery = LgBattery.Get(); } catch (Exception ex) { error ??= ex.Message; }
-        try { _saver = EnergySaver.Get(); } catch (Exception ex) { _saver = null; error ??= ex.Message; }
+        try { _saver = ReadSaver(); } catch (Exception ex) { _saver = null; error ??= ex.Message; }
         _settingsError = error;
     }
 
@@ -300,7 +329,12 @@ public sealed class TrayApp : ApplicationContext
         string? error = _sensorError ?? _settingsError;
         _statusItem.Text = error is null ? $"ファン {fan}　CPU {cpu} / {load} / {ghz}" : "読み取り失敗: " + error;
 
-        string tip = $"gram 冷却: {mode}\nファン {fan}\nCPU {cpu} / {load} / {ghz}";
+        string? boost = BoostText();
+        _boostItem.Visible = boost is not null;
+        if (boost is not null)
+            _boostItem.Text = boost;
+
+        string tip = $"gram 冷却: {mode}\nファン {fan}\nCPU {cpu} / {load} / {ghz}" + (boost is null ? "" : "\n" + boost);
         tip = tip.Length <= 127 ? tip : tip[..127];
         if (_tray.Text != tip)
             _tray.Text = tip;
@@ -399,16 +433,25 @@ public sealed class TrayApp : ApplicationContext
         return p;
     }
 
-    private void ShowError(string message) =>
+    private void ShowError(string message)
+    {
+        Log.Write("エラー通知: " + message);
+        ShowBalloon(message);
+    }
+
+    private void ShowBalloon(string message) =>
         _tray.ShowBalloonTip(5000, "gram 冷却", message, ToolTipIcon.Error);
 
     protected override void ExitThreadCore()
     {
         _timer.Stop();
         _updater.Dispose();
+        SystemEvents.SessionEnding -= OnSessionEnding;
         SystemEvents.SessionSwitch -= OnSessionSwitch;
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+        EnergySaverState.Changed -= OnEnergySaverChanged;
+        EnergySaverState.Stop();
         _cpu?.Dispose();
         _tray.Visible = false;
         _tray.Dispose();

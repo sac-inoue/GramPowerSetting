@@ -7,6 +7,12 @@ namespace GramCooling;
 /// 公開 API が無いため、設定アプリと同じ設定ハンドラ (SettingsHandlers_OneCore_BatterySaver.dll の GetSetting) で
 /// SystemSettings_PowerAndBattery_EnergySaverAlwaysOn を読み書きする。ISettingItem は非公開インターフェースなので、
 /// get_Id が一致することを確かめてから使う。
+///
+/// 注意（実測）:
+///   - 読み取りは信用できない。同じプロセスでは数分古いままで、別プロセスどうしでも値が食い違う。
+///     状態は EnergySaverState（実効電源モード）で判定すること。
+///   - 書き込みは「指定値にする」ではなく実質「切り替え」として働く（OFF のときに OFF を書くと ON になる）。
+///   - ISettingItem の Release がまれに戻ってこない。常駐プロセスからは EnergySaverProcess（子プロセス）経由で使う。
 /// </summary>
 public static unsafe class EnergySaver
 {
@@ -20,54 +26,76 @@ public static unsafe class EnergySaver
     private static readonly Guid IidPropertyValue = new("4BD682DD-7554-40E9-9A9B-82654EDE7E62");
     private static readonly Guid IidPropertyValueStatics = new("629BDBC8-D932-4FF4-96B9-8D96C5C1E858");
 
-    // DLL のロードと ISettingItem の取得・検証は最初の1回だけ行い、プロセス終了まで使い回す
+    private const string DllPath = @"C:\Windows\System32\SettingsHandlers_OneCore_BatterySaver.dll";
     private static readonly object Lock = new();
-    private static IntPtr _item;
 
-    public static bool Get()
+    /// <summary>
+    /// ISettingItem の Release と DLL の解放を省く。Release がまれに戻ってこないため、
+    /// すぐ終了する使い捨ての子プロセスでは片付けをプロセス終了に任せる。
+    /// </summary>
+    public static bool SkipCleanup { get; set; }
+
+    public static bool Get() => WithItem(item =>
+    {
+        IntPtr val;
+        using (var name = new HString("Value"))
+            Check(((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr*, int>)VTable(item)[VtGetValue])(item, name.Handle, &val));
+        try
+        {
+            Guid iid = IidPropertyValue;
+            Check(Marshal.QueryInterface(val, in iid, out IntPtr pv));
+            try
+            {
+                byte b;
+                Check(((delegate* unmanaged[Stdcall]<IntPtr, byte*, int>)VTable(pv)[18])(pv, &b));  // IPropertyValue::GetBoolean
+                return b != 0;
+            }
+            finally { Marshal.Release(pv); }
+        }
+        finally { Marshal.Release(val); }
+    });
+
+    public static void Set(bool on) => WithItem(item =>
+    {
+        IntPtr boxed = CreateBoolean(on);
+        try
+        {
+            using var name = new HString("Value");
+            Check(((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, int>)VTable(item)[VtSetValue])(item, name.Handle, boxed));
+        }
+        finally { Marshal.Release(boxed); }
+        return 0;
+    });
+
+    /// <summary>DLL を読み込んで ISettingItem を取り出し、使い終わったら DLL ごと解放する。</summary>
+    private static T WithItem<T>(Func<IntPtr, T> use)
     {
         lock (Lock)
         {
-            IntPtr item = Item();
-            IntPtr val;
-            using (var name = new HString("Value"))
-                Check(((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr*, int>)VTable(item)[VtGetValue])(item, name.Handle, &val));
+            IntPtr dll = NativeLibrary.Load(DllPath);
             try
             {
-                Guid iid = IidPropertyValue;
-                Check(Marshal.QueryInterface(val, in iid, out IntPtr pv));
+                IntPtr item = OpenItem(dll);
                 try
                 {
-                    byte b;
-                    Check(((delegate* unmanaged[Stdcall]<IntPtr, byte*, int>)VTable(pv)[18])(pv, &b));  // IPropertyValue::GetBoolean
-                    return b != 0;
+                    return use(item);
                 }
-                finally { Marshal.Release(pv); }
+                finally
+                {
+                    if (!SkipCleanup)
+                        Marshal.Release(item);
+                }
             }
-            finally { Marshal.Release(val); }
-        }
-    }
-
-    public static void Set(bool on)
-    {
-        lock (Lock)
-        {
-            IntPtr item = Item();
-            IntPtr boxed = CreateBoolean(on);
-            try
+            finally
             {
-                using var name = new HString("Value");
-                Check(((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, IntPtr, int>)VTable(item)[VtSetValue])(item, name.Handle, boxed));
+                if (!SkipCleanup)
+                    NativeLibrary.Free(dll);
             }
-            finally { Marshal.Release(boxed); }
         }
     }
 
-    private static IntPtr Item() => _item != IntPtr.Zero ? _item : (_item = OpenItem());
-
-    private static IntPtr OpenItem()
+    private static IntPtr OpenItem(IntPtr dll)
     {
-        IntPtr dll = NativeLibrary.Load(@"C:\Windows\System32\SettingsHandlers_OneCore_BatterySaver.dll");
         var getSetting = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr*, IntPtr, int>)NativeLibrary.GetExport(dll, "GetSetting");
 
         IntPtr item;

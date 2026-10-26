@@ -11,8 +11,11 @@ LG gram の冷却モードやバッテリー設定をタスクトレイから切
 - 「バッテリー寿命を延ばす」の切り替え（未使用 / 80%まで充電 / AIモード）
 - Windows の「省エネ機能」の ON/OFF
 - ファン回転数 [rpm]・CPU 温度 [℃]・CPU 負荷 [%]・CPU クロック [GHz] の表示
+- ブースト: アプリ起動時は 5 分間、AC アダプタ接続時は 3 分間、冷却モード「高」・省エネ機能 OFF にし、
+  時間が来たらユーザーの設定に戻す（ブースト中にユーザーが変えた項目はそのまま尊重する）
 - ログオン時の自動起動（タスクスケジューラに「最高の権限で実行」で登録）
 - 自動更新（インストール先の `update` フォルダに新しい版を置くと入れ替わる）
+- 動作ログ: `%APPDATA%\GramCooling\log.txt`（起動・終了・ブースト・エラー）
 
 ## 動作環境
 
@@ -50,6 +53,12 @@ dotnet publish -c Release --no-build -o "$env:LOCALAPPDATA\Programs\GramCooling\
 | バッテリー AI モード | `HKCU\Software\LGE\My gram\LGSmartBattery\BatteryLifeToggled` |
 | ファン回転数・CPU 温度 | `MfgFwiPackage.FwiExecL` による EC 読み取り（bank1 0xC8-0xC9 / bank0 0xC8） |
 | 省エネ機能 | 設定アプリの設定ハンドラ（`SystemSettings_PowerAndBattery_EnergySaverAlwaysOn`） |
+
+### 注意: 省エネ機能の読み取り
+
+設定ハンドラは DLL 内に状態を持ち、同じプロセスで読み続けると外での変更が数分間反映されません。
+毎回 DLL を読み込み直して解放しています。それでも書き込みが読み取りに反映されるまで最大 15 秒ほどかかるので、
+書き込み後 30 秒間は書き込んだ値を正としています。
 
 ### 注意: EC を直接読まないこと
 
